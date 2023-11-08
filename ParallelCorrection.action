@@ -1,8 +1,5 @@
 int32 IGNORE_PARAMETER = -1 
 
-float64 lin_vel_max
-float64 travel_dist
-float64 obstacle_stop_dist
 bool right_wall
 bool left_wall
 bool front_wall
@@ -19,7 +16,6 @@ int8 result
 string text
 uint8 sequence
 
-float64 travel_dist 
 int64 total_time
 
 ---------
@@ -28,5 +24,4 @@ int8 sequence
 string text
 int64 timeout
 
-float64 current_travel_dist
 int64 total_time
