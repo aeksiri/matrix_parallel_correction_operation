@@ -1,0 +1,485 @@
+#! /usr/bin/env python
+
+import rospy
+import actionlib
+from matrix_msgs.msg import RobotMode, ParallelCorrectionAction, ParallelCorrectionGoal, ParallelCorrectionFeedback, ParallelCorrectionResult
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from rospy.exceptions import ROSInterruptException
+from enum import Enum
+
+import math
+import numpy as np
+import random
+import sys
+import time
+
+class Sequence(Enum):
+    INIT=0,
+    DATA_CHECKING=1,
+    INIT_PARAM=2,
+    ParallelCorrection_TRACKING=3,
+    FINISH=4,
+    PAUSE=5,
+    ERROR=6
+
+class ActionServer():
+
+    def __init__(self):
+        self.sub_LaserScan = rospy.Subscriber('/scan', LaserScan, self.scan_callback)
+        self.sub_Odom = rospy.Subscriber('/odom', Odometry, self.odom_callback)
+        self.sub_RobotMode = rospy.Subscriber('/matrix_mode_controller/mode', RobotMode, self.mode_callback)   
+        self.pub_cmd_vel = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
+
+
+        self.glob_linear_x_vel = 0.0
+        self.glob_travel_distance = 0.0
+        self.glob_prev_travel_distance = 0.0
+        self.timestmp_begin = 0.0
+        self.timestmp_old = 0.0
+        self.total_time = 0.0
+        self.timer_counter = 0.0
+        self.current_robotmode = 0
+
+        self.msg = LaserScan()
+
+        self.a_server = actionlib.SimpleActionServer(
+            "matrix_parallel_correction_operation", ParallelCorrectionAction, execute_cb=self.execute_cb, auto_start=False)
+        self.a_server.start()
+
+    
+    def mode_callback(self, msg):
+        self.current_robotmode = msg.robot_mode
+
+    
+    def odom_callback(self, msg):
+        dt = 0.0333333333
+        current_linear_x_vel = msg.twist.twist.linear.x
+        current_angular_z_vel = msg.twist.twist.angular.z
+
+        current_distance = current_linear_x_vel*dt
+        #print(current_distance)
+        self.glob_travel_distance = self.glob_travel_distance + current_distance
+        #print(self.glob_travel_distance)
+        #self.glob_prev_travel_distance = self.glob_linear_x_vel
+        #print(".")
+    
+    def scan_callback(self, raw_msg):
+        self.msg = raw_msg
+        # print("scan_callback")
+    
+    def update_command_vel(self, angular_vel):
+        msg = Twist()
+
+        max_angular_vel = 0.2
+
+        if(angular_vel >= max_angular_vel):
+            angular_vel = max_angular_vel
+        elif(angular_vel <= -max_angular_vel):
+            angular_vel = -max_angular_vel
+        else:
+            pass
+
+        msg.linear.x = 0.0
+        msg.angular.z = angular_vel
+        self.pub_cmd_vel.publish(msg)
+
+    def execute_cb(self, goal):
+
+        success = True
+        finish = False
+
+        feedback = ParallelCorrectionFeedback()
+        result = ParallelCorrectionResult()
+        rate = rospy.Rate(10)
+
+        sequence = Sequence.INIT.value
+        text=""
+        timeout= 0
+        total_time = 0
+
+        task_result = ParallelCorrectionResult.SUCCESS
+
+        period_state = 0
+        period_text = ""
+        period_timeout_coutdown = 0
+        setTimeOut = 0
+
+        self.glob_travel_distance = 0.0
+        
+        while not finish:
+            # print(text)
+            if self.a_server.is_preempt_requested():
+                self.update_command_vel(0, 0)
+                rospy.logwarn("Preemting !!!!!")
+                
+                success = False
+                finish = True
+
+                result.result = ParallelCorrectionResult.PREEMTING
+                result.sequence = feedback.sequence
+                result.text = "preemting"
+
+                result.travel_dist = feedback.current_travel_dist
+                result.total_time = feedback.total_time
+
+                self.a_server.set_preempted(result)
+
+
+                break
+
+            if sequence == Sequence.INIT.value:
+                text = "INIT"
+                # print("[seq]--> current order target process: " + str(i))
+                # print("x: " + str(goal.target[i].pose.position.x))
+                # print("y: " + str(goal.target[i].pose.position.y))
+                # print("heading w : " + str(goal.target[i].pose.orientation.w))
+                sequence = Sequence.DATA_CHECKING.value
+                # break
+            
+            elif sequence == Sequence.DATA_CHECKING.value:
+                text="DATA_CHECKING"
+                # if len(self.msg.ranges) == goal.num_lidar_data:
+                #     sequence = Sequence.INIT_PARAM.value
+                # else:
+                #     text = text + "Data missmatch"
+                #     task_result = WallFollowingResult.NUM_DATA_MISSMATCH
+                #     sequence = Sequence.ERROR.value
+                sequence = Sequence.INIT_PARAM.value
+                # break
+
+            elif sequence == Sequence.INIT_PARAM.value:
+                text="INIT_PARAM"
+                self.timestmp_begin = rospy.get_rostime().secs
+                setTimeOut = rospy.get_rostime().secs + goal.timeout
+                sequence = Sequence.ParallelCorrection_TRACKING.value
+                # break
+
+            elif sequence == Sequence.ParallelCorrection_TRACKING.value:
+                text = "ParallelCorrection_TRACKING"
+
+                rightside_wall = goal.right_wall
+                leftside_wall = goal.left_wall
+                frontside_wall = goal.front_wall
+                backside_wall = goal.back_wall
+
+                correction_angle = 35
+
+                left_front_angle = 90-correction_angle #55
+                left_rear_angle = 90+correction_angle #125
+
+                right_front_angle = 270+correction_angle #305
+                right_rear_angle = 270-correction_angle #235
+
+                back_right_angle = 180+correction_angle #215
+                back_left_angle = 180-correction_angle #145
+
+                front_right_angle = 360-correction_angle #324
+                front_left_angle = 0+correction_angle #35
+
+                stop_tolerance = 0.005
+
+                kp = 3.0
+                vel_max_scale = 1.0
+
+                stop_max_range = 2.0
+                stop_min_range = 0.01
+
+                if ((rightside_wall == False) and (leftside_wall == True) and (frontside_wall == False) and (backside_wall == False)):
+                    # --------------------------------------------------------------------------------------#
+                    #
+                    #
+                    #                           LEFT - ParallelCorrection Begin
+                    #
+                    #---------------------------------------------------------------------------------------#
+                    left_front = self.msg.ranges[left_front_angle]
+                    left_rear = self.msg.ranges[left_rear_angle]
+
+                    error = (left_front) - (left_rear)
+
+                    # print(error)
+                    
+                    ang_vel = kp*error
+                    
+                    if (abs(left_front - left_rear) <= stop_tolerance):
+                        self.update_command_vel(0)
+                        print('!!! Left Wall Parallel Correction - DONE !!!', self.glob_travel_distance)
+                        text = "Left Wall Parallel Correction - DONE"
+                        task_result = ParallelCorrectionResult.SUCCESS
+                        success = True
+                        sequence = Sequence.FINISH.value
+                    else:
+                        print('!!! Left Wall Parallel Correcting !!!', abs(left_front-left_rear))
+                        self.update_command_vel(ang_vel)
+
+                    #------------ TIMEOUT CHECKING -----------#
+                    self.timer_counter = rospy.get_rostime().secs - self.timestmp_begin
+                    total_time = self.timer_counter
+                    
+                    if goal.timeout != ParallelCorrectionGoal.IGNORE_PARAMETER:
+                        timeout = setTimeOut - rospy.get_rostime().secs
+                        rospy.loginfo("[matrix_parallel_correction_operation]:Check timeout countdown " + str(timeout))
+                        if rospy.get_rostime().secs > setTimeOut:
+                            self.update_command_vel(0)
+                            text = text + "Timeout"
+                            task_result = ParallelCorrectionResult.TIME_OUT
+                            sequence = Sequence.ERROR.value
+                            rospy.logerr(text)
+                        else:
+                            pass
+                        
+                    else:
+                        timeout = ParallelCorrectionGoal.IGNORE_PARAMETER
+                        # rospy.loginfo("no timeout")
+                    
+                    # --------------------------------------------------------------------------------------#
+                    #
+                    #
+                    #                           LEFT - ParallelCorrection END
+                    #
+                    #---------------------------------------------------------------------------------------#
+
+                elif ((rightside_wall == True) and (leftside_wall == False) and (frontside_wall == False) and (backside_wall == False)):
+                    # --------------------------------------------------------------------------------------#
+                    #
+                    #
+                    #                           RIGHT - ParallelCorrection Begin
+                    #
+                    #---------------------------------------------------------------------------------------#
+                    right_front = self.msg.ranges[right_front_angle]
+                    right_rear = self.msg.ranges[right_rear_angle]
+
+                    error = (right_rear) - (right_front)
+ 
+                    # print(error)
+
+                    ang_vel = kp*error
+
+                    if (abs(right_front - right_rear) <= stop_tolerance):
+                        self.update_command_vel(0)
+                        print('!!! Right Wall Parallel Correction - DONE !!!', self.glob_travel_distance)
+                        text = "Right Wall Parallel Correction - DONE"
+                        task_result = ParallelCorrectionResult.SUCCESS
+                        success = True
+                        sequence = Sequence.FINISH.value
+                    else:
+                        print('!!! Right Wall Parallel Correcting !!!', abs(right_front-right_rear))
+                        self.update_command_vel(ang_vel)
+
+
+                    #------------ TIMEOUT CHECKING -----------#
+                    self.timer_counter = rospy.get_rostime().secs - self.timestmp_begin
+                    total_time = self.timer_counter
+                    
+                    if goal.timeout != ParallelCorrectionGoal.IGNORE_PARAMETER:
+                        timeout = setTimeOut - rospy.get_rostime().secs
+                        rospy.loginfo("[matrix_parallel_correction_operation]:Check timeout countdown " + str(timeout))
+                        if rospy.get_rostime().secs > setTimeOut:
+                            self.update_command_vel(0)
+                            text = text + "Timeout"
+                            task_result = ParallelCorrectionResult.TIME_OUT
+                            sequence = Sequence.ERROR.value
+                            rospy.logerr(text)
+                        else:
+                            pass
+                    else:
+                        timeout = ParallelCorrectionGoal.IGNORE_PARAMETER
+                        # rospy.loginfo("no timeout")
+                    
+                    # --------------------------------------------------------------------------------------#
+                    #
+                    #
+                    #                           RIGHT - ParallelCorrection END
+                    #
+                    #---------------------------------------------------------------------------------------#
+                
+                elif ((rightside_wall == False) and (leftside_wall == False) and (frontside_wall == False) and (backside_wall == True)):
+                    # --------------------------------------------------------------------------------------#
+                    #
+                    #
+                    #                           BACK- ParallelCorrection Begin
+                    #
+                    #---------------------------------------------------------------------------------------#
+                    back_right = self.msg.ranges[back_right_angle]
+                    back_left = self.msg.ranges[back_left_angle]
+
+                    error = (back_left) - (back_right)
+ 
+                    # print(error)
+
+                    ang_vel = kp*error
+
+                    if (abs(back_left - back_right) <= stop_tolerance):
+                        self.update_command_vel(0)
+                        print('!!! Back Wall Parallel Correction - DONE !!!', self.glob_travel_distance)
+                        text = "Back Wall Parallel Correction - DONE"
+                        task_result = ParallelCorrectionResult.SUCCESS
+                        success = True
+                        sequence = Sequence.FINISH.value
+                    else:
+                        print('!!! Back Wall Parallel Correcting !!!', abs(back_left-back_right))
+                        self.update_command_vel(ang_vel)
+
+
+                    #------------ TIMEOUT CHECKING -----------#
+                    self.timer_counter = rospy.get_rostime().secs - self.timestmp_begin
+                    total_time = self.timer_counter
+                    
+                    if goal.timeout != ParallelCorrectionGoal.IGNORE_PARAMETER:
+                        timeout = setTimeOut - rospy.get_rostime().secs
+                        rospy.loginfo("[matrix_ParallelCorrection_operation]:Check timeout countdown " + str(timeout))
+                        if rospy.get_rostime().secs > setTimeOut:
+                            self.update_command_vel(0)
+                            text = text + "Timeout"
+                            task_result = ParallelCorrectionResult.TIME_OUT
+                            sequence = Sequence.ERROR.value
+                            rospy.logerr(text)
+                        else:
+                            pass
+                    else:
+                        timeout = ParallelCorrectionGoal.IGNORE_PARAMETER
+                        # rospy.loginfo("no timeout")
+                    
+                    # --------------------------------------------------------------------------------------#
+                    #
+                    #
+                    #                           BACK - ParallelCorrection END
+                    #
+                    #---------------------------------------------------------------------------------------#
+
+                elif ((rightside_wall == False) and (leftside_wall == False) and (frontside_wall == True) and (backside_wall == False)):
+                    # --------------------------------------------------------------------------------------#
+                    #
+                    #
+                    #                           FRONT- ParallelCorrection Begin
+                    #
+                    #---------------------------------------------------------------------------------------#
+                    front_left = self.msg.ranges[front_left_angle]
+                    front_right = self.msg.ranges[front_right_angle]
+
+                    error = (front_right) - (front_left)
+ 
+                    # print(error)
+
+                    ang_vel = kp*error
+
+                    if (abs(front_left - front_right) <= stop_tolerance):
+                        self.update_command_vel(0)
+                        print('!!! Front Wall Parallel Correction - DONE !!!', self.glob_travel_distance)
+                        text = "Front Wall Parallel Correction - DONE"
+                        task_result = ParallelCorrectionResult.SUCCESS
+                        success = True
+                        sequence = Sequence.FINISH.value
+                    else:
+                        print('!!! Front Wall Parallel Correcting !!!', abs(front_left-front_right))
+                        self.update_command_vel(ang_vel)
+
+
+                    #------------ TIMEOUT CHECKING -----------#
+                    self.timer_counter = rospy.get_rostime().secs - self.timestmp_begin
+                    total_time = self.timer_counter
+                    
+                    if goal.timeout != ParallelCorrectionGoal.IGNORE_PARAMETER:
+                        timeout = setTimeOut - rospy.get_rostime().secs
+                        rospy.loginfo("[matrix_parallel_correction_operation]:Check timeout countdown " + str(timeout))
+                        if rospy.get_rostime().secs > setTimeOut:
+                            self.update_command_vel(0)
+                            text = text + "Timeout"
+                            task_result = ParallelCorrectionResult.TIME_OUT
+                            sequence = Sequence.ERROR.value
+                            rospy.logerr(text)
+                        else:
+                            pass
+                    else:
+                        timeout = ParallelCorrectionGoal.IGNORE_PARAMETER
+                        # rospy.loginfo("no timeout")
+                    
+                    # --------------------------------------------------------------------------------------#
+                    #
+                    #
+                    #                           FRONT - ParallelCorrection END
+                    #
+                    #---------------------------------------------------------------------------------------#
+                else:
+                    self.update_command_vel(0)
+                    text = "ERROR - please choose LEFT, RIGHT, BACK or FRONT"
+                    task_result = ParallelCorrectionResult.PREEMTING
+                    success = True
+                    sequence = Sequence.FINISH.value
+                    rospy.logerr(text)
+
+            elif sequence == Sequence.ERROR.value:
+                self.update_command_vel(0)
+                success = True
+                sequence = Sequence.FINISH.value
+            
+            elif sequence == Sequence.PAUSE.value:
+                if self.current_robotmode != RobotMode.PAUSE:
+                    self.update_command_vel(0)
+                    sequence = period_state
+                    text = period_text
+                    period_text = ""
+                    setTimeOut = rospy.get_rostime().secs + period_timeout_coutdown
+                else:
+                    pass
+                # break
+
+            elif sequence == Sequence.FINISH.value:
+                self.update_command_vel(0)
+                text = "FINISH"
+                finish = True
+                success = True
+                # break
+                
+            else:
+                self.update_command_vel(0)
+                break
+            
+            #//**********************************************************//
+            #//                                                          //
+            #//                      check pause state                   //
+            #//                                                          //
+            #//**********************************************************//
+            if self.current_robotmode == RobotMode.PAUSE and sequence != Sequence.PAUSE.value:
+                self.update_command_vel(0)
+                period_state = sequence
+                period_text = text
+                sequence = Sequence.PAUSE.value
+                period_timeout_coutdown = setTimeOut - rospy.get_rostime().secs
+                text = period_text + "  [Pausing_mode]"
+            else:
+                pass
+            
+            
+            # feedback.sequence = sequence
+            feedback.text = text
+            feedback.current_travel_dist = self.glob_travel_distance
+            feedback.total_time = total_time
+            feedback.timeout = timeout
+            self.a_server.publish_feedback(feedback)
+            print("")
+
+            rate.sleep()
+
+        print("")
+        print("")
+        print("")
+
+        result.result = task_result
+        result.sequence = feedback.sequence
+        result.text = feedback.text
+
+        result.travel_dist = feedback.current_travel_dist
+        result.total_time = feedback.total_time
+
+        print(success)
+        if success == True:
+            self.a_server.set_succeeded(result)
+        else:
+            pass
+
+if __name__ == "__main__":
+    rospy.init_node("action_server")
+    s = ActionServer()
+    rospy.spin()
